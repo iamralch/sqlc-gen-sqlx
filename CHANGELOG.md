@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.7](https://github.com/mathematic-inc/sqlc-gen-sqlx/compare/v0.2.6...v0.2.7) (2026-09-20)
+
+
+### Bug Fixes
+
+* **deps:** Update rustls security fix ([b31da6c](https://github.com/mathematic-inc/sqlc-gen-sqlx/commit/b31da6cab954ac9527885d410204dbcfc5b8ecd7))
+
 ## [0.2.6](https://github.com/mathematic-inc/sqlc-gen-sqlx/compare/v0.2.5...v0.2.6) (2026-09-07)
 
 
