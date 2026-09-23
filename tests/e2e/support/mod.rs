@@ -20,15 +20,17 @@ use testcontainers_modules::{
 pub enum Engine {
     Postgres,
     Mysql,
+    Sqlite,
 }
 
 impl Engine {
-    pub const ALL: [Engine; 2] = [Engine::Postgres, Engine::Mysql];
+    pub const ALL: [Engine; 3] = [Engine::Postgres, Engine::Mysql, Engine::Sqlite];
 
     fn from_name(name: &str) -> Result<Self, Box<dyn Error>> {
         match name {
             "postgresql" | "postgres" => Ok(Self::Postgres),
             "mysql" => Ok(Self::Mysql),
+            "sqlite" => Ok(Self::Sqlite),
             other => Err(format!("e2e cases do not cover sqlc engine '{other}'").into()),
         }
     }
@@ -40,6 +42,7 @@ impl Engine {
                 r#""postgres", "runtime-tokio", "macros", "uuid", "chrono", "ipnetwork", "mac_address", "bit-vec", "bigdecimal""#
             }
             Self::Mysql => r#""mysql", "runtime-tokio", "macros", "uuid", "chrono", "bigdecimal""#,
+            Self::Sqlite => r#""sqlite", "runtime-tokio", "macros", "uuid", "chrono""#,
         }
     }
 }
@@ -54,10 +57,13 @@ pub struct Case {
     pub expected_stderr: Option<String>,
 }
 
-/// A running database container, kept alive for the duration of a run.
+/// A database the cases can run against, kept alive for the duration of a run.
+/// The server engines hold their container; SQLite holds the temp directory its
+/// file lives in.
 pub enum Database {
     Postgres(ContainerAsync<Postgres>),
     Mysql(ContainerAsync<Mysql>),
+    Sqlite(TempDir),
 }
 
 pub async fn start_database(engine: Engine) -> Result<Database, Box<dyn Error>> {
@@ -72,6 +78,7 @@ pub async fn start_database(engine: Engine) -> Result<Database, Box<dyn Error>> 
         ),
         // The module image sets no root password and creates a `test` database.
         Engine::Mysql => Database::Mysql(Mysql::default().start().await?),
+        Engine::Sqlite => Database::Sqlite(TempDir::new()?),
     })
 }
 
@@ -88,6 +95,10 @@ impl Database {
                 c.get_host().await?,
                 c.get_host_port_ipv4(3306).await?
             ),
+            // `mode=rwc` creates the file on first connect.
+            Self::Sqlite(dir) => {
+                format!("sqlite://{}?mode=rwc", dir.path().join("e2e.db").display())
+            }
         })
     }
 }

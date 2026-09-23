@@ -62,3 +62,12 @@ sql:
         out: examples/mysql/src
         options:
           output: queries.rs
+
+  - schema: examples/sqlite/schema.sql
+    queries: examples/sqlite/queries.sql
+    engine: sqlite
+    codegen:
+      - plugin: sqlc-gen-sqlx
+        out: examples/sqlite/src
+        options:
+          output: queries.rs

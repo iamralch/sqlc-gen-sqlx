@@ -101,6 +101,11 @@ jobs:
         env:
           DATABASE_URL: mysql://root@127.0.0.1:3306/sqlc_test
 
+      # SQLite runs in-process against an in-memory database, so it needs no
+      # service container and no DATABASE_URL.
+      - name: Integration tests (SQLite)
+        run: cargo test -p sqlite-example
+
       - name: Verify package
         run: cargo package --locked
 
