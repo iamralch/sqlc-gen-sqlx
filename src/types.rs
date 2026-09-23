@@ -41,6 +41,7 @@ impl TypeMap {
         let defaults = match engine {
             Engine::Postgresql => postgres_defaults(),
             Engine::Mysql => mysql_defaults(),
+            Engine::Sqlite => sqlite_defaults(),
         };
 
         let mut type_overrides: HashMap<String, OverrideEntry> = HashMap::new();
@@ -339,32 +340,109 @@ fn mysql_defaults() -> HashMap<&'static str, (&'static str, bool)> {
     defaults
 }
 
+/// Built-in SQLite type mappings: db type name → (Rust type, copy-cheap).
+///
+/// SQLite columns carry a *declared* type, not an enforced one, and any name is
+/// legal. These are the names SQLite's own type-affinity rules recognize, which
+/// is what schemas in the wild actually use. Keys are normalized by
+/// [`normalize_db_type`], which for SQLite strips widths and all whitespace, so
+/// `UNSIGNED BIG INT` and `VARYING CHARACTER(255)` land on the keys below.
+fn sqlite_defaults() -> HashMap<&'static str, (&'static str, bool)> {
+    let mut defaults: HashMap<&'static str, (&'static str, bool)> = HashMap::new();
+
+    // INTEGER affinity. SQLite stores every integer as a 64-bit value and does
+    // not honour the declared width, so they all map to `i64`.
+    for n in [
+        "int",
+        "integer",
+        "tinyint",
+        "smallint",
+        "mediumint",
+        "bigint",
+        "unsignedbigint",
+        "int2",
+        "int8",
+    ] {
+        defaults.insert(n, ("i64", true));
+    }
+
+    // TEXT affinity.
+    for n in [
+        "character",
+        "varchar",
+        "varyingcharacter",
+        "nchar",
+        "nativecharacter",
+        "nvarchar",
+        "text",
+        "clob",
+    ] {
+        defaults.insert(n, ("String", false));
+    }
+
+    // BLOB affinity.
+    defaults.insert("blob", ("Vec<u8>", false));
+
+    // REAL affinity. `decimal` and `numeric` are included because SQLite has no
+    // exact decimal type — it stores them as floats, and sqlx has no
+    // `BigDecimal` support for SQLite.
+    for n in [
+        "real",
+        "double",
+        "doubleprecision",
+        "float",
+        "decimal",
+        "numeric",
+    ] {
+        defaults.insert(n, ("f64", true));
+    }
+
+    for n in ["boolean", "bool"] {
+        defaults.insert(n, ("bool", true));
+    }
+
+    defaults.insert("date", ("chrono::NaiveDate", true));
+    for n in ["datetime", "timestamp"] {
+        defaults.insert(n, ("chrono::NaiveDateTime", false));
+    }
+
+    defaults
+}
+
 /// Normalize a database type name into a lookup key.
 ///
 /// PostgreSQL type names arrive already canonical from sqlc, so they are only
-/// lowercased — anything more would change existing resolutions. MySQL reports
-/// declared types verbatim (`VARCHAR(255)`, `INT(11) UNSIGNED`), so the width
-/// is dropped and interior whitespace collapsed.
+/// lowercased — anything more would change existing resolutions. MySQL and
+/// SQLite report declared types verbatim (`VARCHAR(255)`, `INT(11) UNSIGNED`,
+/// `UNSIGNED BIG INT`), so the width is dropped. MySQL keeps single spaces
+/// because `int` and `int unsigned` are genuinely different types; SQLite drops
+/// whitespace entirely because its multi-word names are single types.
 fn normalize_db_type(engine: Engine, db_type: &str) -> String {
     let lowered = db_type.trim().to_lowercase();
+    if engine == Engine::Postgresql {
+        return lowered;
+    }
+
+    let mut out = String::with_capacity(lowered.len());
+    let mut depth = 0usize;
+    for ch in lowered.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            _ => out.push(ch),
+        }
+    }
+
     match engine {
-        Engine::Postgresql => lowered,
+        Engine::Postgresql => unreachable!("handled above"),
         Engine::Mysql => {
-            let mut out = String::with_capacity(lowered.len());
-            let mut depth = 0usize;
-            for ch in lowered.chars() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => depth = depth.saturating_sub(1),
-                    _ if depth > 0 => {}
-                    // `int unsigned zerofill` implies `unsigned`; dropping the
-                    // modifier keeps both spellings on one key.
-                    _ => out.push(ch),
-                }
-            }
+            // `int unsigned zerofill` implies `unsigned`; dropping the modifier
+            // keeps both spellings on one key.
             let out = out.replace("zerofill", " ");
             out.split_whitespace().collect::<Vec<_>>().join(" ")
         }
+        Engine::Sqlite => out.split_whitespace().collect(),
     }
 }
 
@@ -569,6 +647,61 @@ mod tests {
             borrowed_rs_type: None,
             copy_cheap: false,
         }
+    }
+
+    #[test]
+    fn sqlite_normalizes_multi_word_declared_types() {
+        let map = TypeMap::new(Engine::Sqlite, &[], &[]);
+        assert_eq!(
+            map.resolve_db_type("UNSIGNED BIG INT", false, false)
+                .unwrap()
+                .rust_type,
+            "i64"
+        );
+        assert_eq!(
+            map.resolve_db_type("VARYING CHARACTER(255)", false, false)
+                .unwrap()
+                .rust_type,
+            "String"
+        );
+    }
+
+    #[test]
+    fn mysql_keeps_unsigned_as_a_distinct_type() {
+        let map = TypeMap::new(Engine::Mysql, &[], &[]);
+        assert_eq!(
+            map.resolve_db_type("INT(11)", false, false)
+                .unwrap()
+                .rust_type,
+            "i32"
+        );
+        assert_eq!(
+            map.resolve_db_type("INT(11) UNSIGNED", false, false)
+                .unwrap()
+                .rust_type,
+            "u32"
+        );
+    }
+
+    #[test]
+    fn engines_resolve_the_same_name_differently() {
+        // `bigint` is 64-bit everywhere, but `integer` is 32-bit in PostgreSQL
+        // and 64-bit in SQLite, which stores every integer as i64.
+        let pg = TypeMap::new(Engine::Postgresql, &[], &[]);
+        let sqlite = TypeMap::new(Engine::Sqlite, &[], &[]);
+        assert_eq!(
+            pg.resolve_db_type("integer", false, false)
+                .unwrap()
+                .rust_type,
+            "i32"
+        );
+        assert_eq!(
+            sqlite
+                .resolve_db_type("integer", false, false)
+                .unwrap()
+                .rust_type,
+            "i64"
+        );
     }
 
     #[test]

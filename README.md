@@ -51,9 +51,10 @@ matching sqlx driver. Anything else is rejected with an error.
 | --- | --- | --- |
 | `postgresql` | `sqlx::Postgres` | Full support, including composite types and `= ANY($1)` array binding |
 | `mysql` | `sqlx::MySql` | `ENUM` columns become Rust enums; no composite types |
+| `sqlite` | `sqlx::Sqlite` | No enums or composite types; declared types drive the mapping |
 
-Enable the matching sqlx feature in your own `Cargo.toml` (`postgres` or
-`mysql`). The rest of this README uses PostgreSQL in its examples; where the two
+Enable the matching sqlx feature in your own `Cargo.toml` (`postgres`, `mysql`
+or `sqlite`). The rest of this README uses PostgreSQL in its examples; where the
 engines differ, the difference is called out.
 
 ## What it generates
@@ -65,7 +66,7 @@ For each SQL query annotated with a sqlc command, the plugin emits:
 - An optional params struct (`QueryNameParams`) when a query has 2+ parameters.
 - A free `pub async fn` (or `pub fn` for batch streams) that executes the query, taking the executor as its first argument.
 
-The executor argument is generic over the `AsExecutor` trait emitted in the same file. `AsExecutor` is implemented for the natural sqlx reference types of the target engine — for PostgreSQL that is `&PgPool`, `&mut PgConnection`, `&mut Transaction<'_, Postgres>`, `&mut PoolConnection<Postgres>`, and `&mut T` of each; for MySQL the same shapes over `MySqlPool`, `MySqlConnection` and `MySql`:
+The executor argument is generic over the `AsExecutor` trait emitted in the same file. `AsExecutor` is implemented for the natural sqlx reference types of the target engine — for PostgreSQL that is `&PgPool`, `&mut PgConnection`, `&mut Transaction<'_, Postgres>`, `&mut PoolConnection<Postgres>`, and `&mut T` of each; MySQL and SQLite get the same shapes over their own driver types:
 
 ```rust
 // From a pool:
@@ -256,14 +257,37 @@ options:
 
 MySQL has no composite types, so nothing is generated for them.
 
+## Supported SQLite types
+
+SQLite columns carry a *declared* type rather than an enforced one, and the
+declared name can be anything. The names below are the ones SQLite's own
+type-affinity rules recognize; widths are ignored and multi-word names are
+matched without their spaces, so `UNSIGNED BIG INT` and
+`VARYING CHARACTER(255)` resolve as listed.
+
+| SQLite | Rust |
+|---|---|
+| `int` / `integer` / `tinyint` / `smallint` / `mediumint` / `bigint` / `unsigned big int` / `int2` / `int8` | `i64` |
+| `text` / `clob` / `character` / `varchar` / `varying character` / `nchar` / `native character` / `nvarchar` | `String` |
+| `blob` | `Vec<u8>` |
+| `real` / `double` / `double precision` / `float` / `numeric` / `decimal` | `f64` |
+| `boolean` / `bool` | `bool` |
+| `date` | `chrono::NaiveDate` |
+| `datetime` / `timestamp` | `chrono::NaiveDateTime` |
+
+Every SQLite integer is stored as a 64-bit value regardless of the declared
+width, so they all map to `i64`. SQLite has no exact decimal type — `numeric`
+and `decimal` are stored as floats and map to `f64`; use an override if you need
+something else. SQLite has neither enums nor composite types.
+
 ## Supported query annotations
 
 | Annotation | Return type | Description |
 |---|---|---|
 | `:exec` | `Result<(), sqlx::Error>` | Execute, discard result |
 | `:execrows` | `Result<u64, sqlx::Error>` | Execute, return rows affected |
-| `:execresult` | `Result<PgQueryResult, sqlx::Error>` / `Result<MySqlQueryResult, sqlx::Error>` | Execute, return the driver's full result |
-| `:execlastid` | `Result<T, sqlx::Error>` (PostgreSQL) / `Result<u64, sqlx::Error>` (MySQL) | Generated key |
+| `:execresult` | `Result<PgQueryResult / MySqlQueryResult / SqliteQueryResult, sqlx::Error>` | Execute, return the driver's full result |
+| `:execlastid` | `Result<T, sqlx::Error>` (PostgreSQL) / `Result<u64, sqlx::Error>` (MySQL) / `Result<i64, sqlx::Error>` (SQLite) | Generated key |
 | `:one` | `Result<QueryRow, sqlx::Error>` | Fetch exactly one row |
 | `:many` | `Result<Vec<QueryRow>, sqlx::Error>` | Fetch all rows |
 | `:batchexec` | `impl Stream<Item = Result<(), sqlx::Error>>` | Lazily execute once per item |
@@ -275,9 +299,11 @@ MySQL has no composite types, so nothing is generated for them.
 last-insert-id, so sqlc requires a `RETURNING` clause and the value comes back
 typed as that column. MySQL reports it on the query result, so the generated
 function returns `u64` from `last_insert_id()` and the query needs no
-`RETURNING`.
+`RETURNING`; SQLite does the same but its rowid is signed, so the return is
+`i64` from `last_insert_rowid()`.
 
-The batch annotations are PostgreSQL-only; sqlc does not accept them for MySQL.
+The batch annotations and `:copyfrom` are PostgreSQL-only for SQLite; sqlc does
+not accept batch annotations for MySQL either.
 
 All functions are free `pub async fn` (or `pub fn` for batch streams) at module scope, taking the executor as their first argument. The bound is `E: AsExecutor`, where `AsExecutor` is the trait emitted in each generated file.
 
@@ -285,7 +311,7 @@ Batch methods generate `Stream`-returning APIs and reference `futures_core` and 
 
 ## sqlc extensions
 
-- **`sqlc.slice()`**: Parameters marked as slice expand to `Vec<T>` and support runtime placeholder expansion for `IN (sqlc.slice(...))`-style queries. On PostgreSQL a query that binds the slice natively (`= ANY($1)`) skips the rewrite and passes the `Vec` straight through; every other case — and every MySQL query — expands to one placeholder per element, with an empty slice becoming `IN (NULL)`.
+- **`sqlc.slice()`**: Parameters marked as slice expand to `Vec<T>` and support runtime placeholder expansion for `IN (sqlc.slice(...))`-style queries. On PostgreSQL a query that binds the slice natively (`= ANY($1)`) skips the rewrite and passes the `Vec` straight through; every other case — and every MySQL or SQLite query — expands to one placeholder per element, with an empty slice becoming `IN (NULL)`.
 - **`sqlc.embed(table)`**: Result columns from an embedded table become a nested struct with `#[sqlx(flatten)]`.
 
 ## Contributing

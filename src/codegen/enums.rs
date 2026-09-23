@@ -5,7 +5,7 @@ use syn::parse_str;
 
 use crate::{
     catalog::EnumInfo,
-    engine::Engine,
+    engine::{Engine, EnumRepr},
     error::Error,
     ident::{type_ident, variant_ident},
 };
@@ -22,17 +22,14 @@ use crate::{
 /// }
 /// ```
 ///
-/// MySQL output differs in two ways, both forced by sqlx:
-///
-/// - There is no `type_name`. PostgreSQL enums are catalog types the wire
-///   protocol resolves by name; MySQL sends `ENUM` columns as strings and has
-///   no type to look up.
-/// - `sqlx::Type` is not derived. Its MySQL impl reports
-///   `MySqlTypeInfo::__enum()`, which the driver's compatibility check does not
-///   accept for a real `ENUM` column — decoding one fails at runtime with
-///   "mismatched types". Only `Encode`/`Decode` are derived, and the `Type`
-///   impl below defers to `str`, which accepts `ENUM`, `CHAR`, `VARCHAR` and
-///   the `TEXT` family.
+/// Engines that keep enums as text drop `type_name`, since there is no catalog
+/// type to resolve by name. MySQL additionally cannot use sqlx's `Type` derive:
+/// its MySQL impl reports `MySqlTypeInfo::__enum()`, which the driver's
+/// compatibility check does not accept for a real `ENUM` column, so decoding
+/// one fails at runtime with "mismatched types". There, only `Encode`/`Decode`
+/// are derived and the `Type` impl is written out, deferring to `str` — which
+/// accepts `ENUM`, `CHAR`, `VARCHAR` and the `TEXT` family. sqlx's SQLite impl
+/// already defers to `str`, so the derive is enough.
 pub fn gen_enum(
     info: &EnumInfo,
     engine: Engine,
@@ -58,15 +55,21 @@ pub fn gen_enum(
         derive_paths.push(quote! { #path });
     }
 
-    Ok(match engine {
-        Engine::Postgresql => quote! {
+    Ok(match engine.enum_repr() {
+        EnumRepr::NamedType => quote! {
             #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type, #(#derive_paths),*)]
             #[sqlx(type_name = #type_name)]
             pub enum #rust_name {
                 #(#variant_tokens)*
             }
         },
-        Engine::Mysql => quote! {
+        EnumRepr::Text => quote! {
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type, #(#derive_paths),*)]
+            pub enum #rust_name {
+                #(#variant_tokens)*
+            }
+        },
+        EnumRepr::TextManualType => quote! {
             #[derive(
                 Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Encode, sqlx::Decode,
                 #(#derive_paths),*
@@ -183,6 +186,27 @@ mod tests {
         assert!(
             code.contains(r#""active""#),
             "expected rename = \"active\" in:\n{code}"
+        );
+    }
+
+    #[test]
+    fn sqlite_enum_uses_the_derive_without_a_type_name() {
+        let code = gen_enum(&status_enum(), Engine::Sqlite, &[])
+            .unwrap()
+            .to_string();
+        // sqlx's SQLite `Type` impl already defers compatibility to `str`, so
+        // unlike MySQL the derive is enough on its own.
+        assert!(
+            code.contains("sqlx :: Type"),
+            "expected the sqlx::Type derive in:\n{code}"
+        );
+        assert!(
+            !code.contains("type_name"),
+            "SQLite enums must not carry #[sqlx(type_name)] in:\n{code}"
+        );
+        assert!(
+            !code.contains("impl sqlx"),
+            "SQLite needs no hand-written impl in:\n{code}"
         );
     }
 

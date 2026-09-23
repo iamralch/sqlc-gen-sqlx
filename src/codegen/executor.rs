@@ -71,6 +71,16 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_impls_reference_sqlite_types() {
+        let code = gen_as_executor(Engine::Sqlite).to_string();
+        assert!(
+            code.contains("SqlitePool"),
+            "expected SqlitePool in:\n{code}"
+        );
+        assert!(!code.contains("MySql"), "unexpected MySql in:\n{code}");
+    }
+
+    #[test]
     fn mysql_impls_reference_mysql_types() {
         let code = gen_as_executor(Engine::Mysql).to_string();
         assert!(code.contains("MySqlPool"), "expected MySqlPool in:\n{code}");

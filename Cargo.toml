@@ -30,7 +30,7 @@ members = [".", "examples/*"]
 
 [workspace.dependencies]
 serde_json = "1"
-sqlx = { version = "0.9", features = ["bigdecimal", "bit-vec", "chrono", "ipnetwork", "mac_address", "mysql", "postgres", "runtime-tokio", "uuid"] }
+sqlx = { version = "0.9", features = ["bigdecimal", "bit-vec", "chrono", "ipnetwork", "mac_address", "mysql", "postgres", "runtime-tokio", "sqlite", "uuid"] }
 tokio = { version = "1", features = ["full"] }
 
 [lib]

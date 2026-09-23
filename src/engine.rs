@@ -15,6 +15,7 @@ pub enum Engine {
     #[default]
     Postgresql,
     Mysql,
+    Sqlite,
 }
 
 /// How the engine spells bind parameters in SQL text.
@@ -36,6 +37,24 @@ pub enum LastInsertId {
     ReturningColumn,
     /// `MySqlQueryResult::last_insert_id() -> u64`.
     MySqlLastInsertId,
+    /// `SqliteQueryResult::last_insert_rowid() -> i64`.
+    SqliteLastInsertRowid,
+}
+
+/// How generated enums reach the wire, which decides what sqlx machinery the
+/// codegen can lean on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnumRepr {
+    /// A catalog type the protocol resolves by name (PostgreSQL). sqlx's `Type`
+    /// derive handles it once given `#[sqlx(type_name)]`.
+    NamedType,
+    /// Text on the wire, and sqlx's `Type` derive already defers compatibility
+    /// to `str` (SQLite).
+    Text,
+    /// Text on the wire, but sqlx's `Type` derive reports a type info the
+    /// driver rejects for real `ENUM` columns (MySQL), so the `Type` impl has
+    /// to be written out.
+    TextManualType,
 }
 
 impl Engine {
@@ -46,8 +65,10 @@ impl Engine {
         match name.trim().to_ascii_lowercase().as_str() {
             "" | "postgresql" | "postgres" => Ok(Self::Postgresql),
             "mysql" => Ok(Self::Mysql),
+            "sqlite" => Ok(Self::Sqlite),
             other => Err(Error::Codegen(format!(
-                "unsupported sqlc engine '{other}'; sqlc-gen-sqlx supports 'postgresql' and 'mysql'"
+                "unsupported sqlc engine '{other}'; \
+                 sqlc-gen-sqlx supports 'postgresql', 'mysql' and 'sqlite'"
             ))),
         }
     }
@@ -56,6 +77,7 @@ impl Engine {
         match self {
             Self::Postgresql => "postgresql",
             Self::Mysql => "mysql",
+            Self::Sqlite => "sqlite",
         }
     }
 
@@ -64,6 +86,7 @@ impl Engine {
         match self {
             Self::Postgresql => quote! { sqlx::Postgres },
             Self::Mysql => quote! { sqlx::MySql },
+            Self::Sqlite => quote! { sqlx::Sqlite },
         }
     }
 
@@ -72,6 +95,7 @@ impl Engine {
         match self {
             Self::Postgresql => quote! { sqlx::PgPool },
             Self::Mysql => quote! { sqlx::MySqlPool },
+            Self::Sqlite => quote! { sqlx::SqlitePool },
         }
     }
 
@@ -80,6 +104,7 @@ impl Engine {
         match self {
             Self::Postgresql => quote! { sqlx::PgConnection },
             Self::Mysql => quote! { sqlx::MySqlConnection },
+            Self::Sqlite => quote! { sqlx::SqliteConnection },
         }
     }
 
@@ -88,13 +113,14 @@ impl Engine {
         match self {
             Self::Postgresql => quote! { sqlx::postgres::PgQueryResult },
             Self::Mysql => quote! { sqlx::mysql::MySqlQueryResult },
+            Self::Sqlite => quote! { sqlx::sqlite::SqliteQueryResult },
         }
     }
 
     pub fn placeholders(self) -> Placeholders {
         match self {
             Self::Postgresql => Placeholders::Numbered,
-            Self::Mysql => Placeholders::Ordinal,
+            Self::Mysql | Self::Sqlite => Placeholders::Ordinal,
         }
     }
 
@@ -102,6 +128,7 @@ impl Engine {
         match self {
             Self::Postgresql => LastInsertId::ReturningColumn,
             Self::Mysql => LastInsertId::MySqlLastInsertId,
+            Self::Sqlite => LastInsertId::SqliteLastInsertRowid,
         }
     }
 
@@ -117,12 +144,23 @@ impl Engine {
         matches!(self, Self::Postgresql)
     }
 
+    /// How generated enums are represented on the wire.
+    pub fn enum_repr(self) -> EnumRepr {
+        match self {
+            Self::Postgresql => EnumRepr::NamedType,
+            Self::Mysql => EnumRepr::TextManualType,
+            Self::Sqlite => EnumRepr::Text,
+        }
+    }
+
     /// Upper bound on bind parameters in a single statement. `:copyfrom`
     /// chunks its multi-row INSERT to stay under this.
     pub fn max_bind_params(self) -> usize {
         match self {
             // Both wire protocols carry the parameter count as u16.
             Self::Postgresql | Self::Mysql => 65_535,
+            // SQLITE_MAX_VARIABLE_NUMBER, the default since SQLite 3.32.
+            Self::Sqlite => 32_766,
         }
     }
 
@@ -149,6 +187,7 @@ mod tests {
         assert_eq!(Engine::from_name("postgresql").unwrap(), Engine::Postgresql);
         assert_eq!(Engine::from_name("postgres").unwrap(), Engine::Postgresql);
         assert_eq!(Engine::from_name("mysql").unwrap(), Engine::Mysql);
+        assert_eq!(Engine::from_name("sqlite").unwrap(), Engine::Sqlite);
     }
 
     #[test]
@@ -166,11 +205,26 @@ mod tests {
     fn placeholders_match_engine() {
         assert_eq!(Engine::Postgresql.placeholder(3), "$3");
         assert_eq!(Engine::Mysql.placeholder(3), "?");
+        assert_eq!(Engine::Sqlite.placeholder(3), "?");
+    }
+
+    #[test]
+    fn sqlite_caps_bind_params_below_the_server_engines() {
+        assert_eq!(Engine::Sqlite.max_bind_params(), 32_766);
+        assert!(Engine::Sqlite.max_bind_params() < Engine::Postgresql.max_bind_params());
     }
 
     #[test]
     fn only_postgres_binds_arrays_natively() {
         assert!(Engine::Postgresql.supports_array_binding());
         assert!(!Engine::Mysql.supports_array_binding());
+        assert!(!Engine::Sqlite.supports_array_binding());
+    }
+
+    #[test]
+    fn only_postgres_derives_enums_by_type_name() {
+        assert_eq!(Engine::Postgresql.enum_repr(), EnumRepr::NamedType);
+        assert_eq!(Engine::Mysql.enum_repr(), EnumRepr::TextManualType);
+        assert_eq!(Engine::Sqlite.enum_repr(), EnumRepr::Text);
     }
 }

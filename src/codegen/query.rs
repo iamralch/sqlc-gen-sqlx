@@ -941,13 +941,19 @@ pub fn gen_execlastid(query: &QueryView<'_>, ctx: &Ctx<'_>) -> Result<TokenStrea
             };
             (quote! { #ret_ty }, body)
         }
-        LastInsertId::MySqlLastInsertId => {
+        LastInsertId::MySqlLastInsertId | LastInsertId::SqliteLastInsertRowid => {
+            let (ret_ty, getter) = match ctx.engine.last_insert_id() {
+                LastInsertId::SqliteLastInsertRowid => {
+                    (quote! { i64 }, quote! { last_insert_rowid })
+                }
+                _ => (quote! { u64 }, quote! { last_insert_id }),
+            };
             let body = if dynamic_slice {
                 quote! {
                     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
                     #bind_setup
                     let result = query.execute(db.as_executor()).await?;
-                    Ok(result.last_insert_id())
+                    Ok(result.#getter())
                 }
             } else {
                 quote! {
@@ -955,10 +961,10 @@ pub fn gen_execlastid(query: &QueryView<'_>, ctx: &Ctx<'_>) -> Result<TokenStrea
                         #binds
                         .execute(db.as_executor())
                         .await?;
-                    Ok(result.last_insert_id())
+                    Ok(result.#getter())
                 }
             };
-            (quote! { u64 }, body)
+            (ret_ty, body)
         }
     };
 

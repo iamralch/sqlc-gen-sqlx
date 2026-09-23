@@ -1,0 +1,5 @@
+CREATE TABLE slice_authors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    country TEXT NOT NULL
+);
