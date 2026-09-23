@@ -27,7 +27,7 @@ pub fn gen_composite(info: &CompositeInfo, extra_derives: &[String]) -> Result<T
         let ty: syn::Type = parse_str(&field.rust_type).map_err(|e| {
             Error::Codegen(format!(
                 "composite '{}' field '{}' invalid type '{}': {e}",
-                info.pg_name, field.pg_name, field.rust_type
+                info.db_name, field.db_name, field.rust_type
             ))
         })?;
         field_tokens.push(quote! { pub #ident: #ty, });
@@ -57,22 +57,22 @@ mod tests {
     fn address_composite() -> CompositeInfo {
         CompositeInfo {
             schema: "public".to_string(),
-            pg_name: "address".to_string(),
+            db_name: "address".to_string(),
             rust_name: "Address".to_string(),
             type_name: "address".to_string(),
             fields: vec![
                 CompositeField {
-                    pg_name: "street".to_string(),
+                    db_name: "street".to_string(),
                     rust_ident: quote::format_ident!("street"),
                     rust_type: "Option<String>".to_string(),
                 },
                 CompositeField {
-                    pg_name: "city".to_string(),
+                    db_name: "city".to_string(),
                     rust_ident: quote::format_ident!("city"),
                     rust_type: "Option<String>".to_string(),
                 },
                 CompositeField {
-                    pg_name: "zip".to_string(),
+                    db_name: "zip".to_string(),
                     rust_ident: quote::format_ident!("zip"),
                     rust_type: "Option<i32>".to_string(),
                 },

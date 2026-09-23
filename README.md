@@ -42,6 +42,20 @@ The release also includes `sqlc-gen-sqlx.wasm`. Continue using `plugins[].wasm`
 with its URL and checksum for sqlc's WASM plugin mode. The native executable
 installed above is used through `plugins[].process.cmd: sqlc-gen-sqlx` instead.
 
+## Supported engines
+
+The plugin reads `sql[*].engine` from your sqlc config and generates for the
+matching sqlx driver. Anything else is rejected with an error.
+
+| sqlc `engine` | sqlx driver | Notes |
+| --- | --- | --- |
+| `postgresql` | `sqlx::Postgres` | Full support, including composite types and `= ANY($1)` array binding |
+| `mysql` | `sqlx::MySql` | `ENUM` columns become Rust enums; no composite types |
+
+Enable the matching sqlx feature in your own `Cargo.toml` (`postgres` or
+`mysql`). The rest of this README uses PostgreSQL in its examples; where the two
+engines differ, the difference is called out.
+
 ## What it generates
 
 For each SQL query annotated with a sqlc command, the plugin emits:
@@ -51,7 +65,7 @@ For each SQL query annotated with a sqlc command, the plugin emits:
 - An optional params struct (`QueryNameParams`) when a query has 2+ parameters.
 - A free `pub async fn` (or `pub fn` for batch streams) that executes the query, taking the executor as its first argument.
 
-The executor argument is generic over the `AsExecutor` trait emitted in the same file. `AsExecutor` is implemented for `&PgPool`, `&mut PgConnection`, `&mut Transaction<'_, Postgres>`, `&mut PoolConnection<Postgres>`, and `&mut T` of each — i.e. the natural sqlx reference types:
+The executor argument is generic over the `AsExecutor` trait emitted in the same file. `AsExecutor` is implemented for the natural sqlx reference types of the target engine — for PostgreSQL that is `&PgPool`, `&mut PgConnection`, `&mut Transaction<'_, Postgres>`, `&mut PoolConnection<Postgres>`, and `&mut T` of each; for MySQL the same shapes over `MySqlPool`, `MySqlConnection` and `MySql`:
 
 ```rust
 // From a pool:
@@ -104,7 +118,8 @@ All options are passed in `codegen[*].options`:
 
 ### Type overrides
 
-Override the Rust type used for a PostgreSQL column type or a specific column:
+Override the Rust type used for a database column type or a specific column.
+`db_type` is matched against the engine's own type names:
 
 ```yaml
 options:
@@ -203,14 +218,52 @@ directly without re-collecting.
 
 Array types (`type[]`) become `Vec<T>`. Nullable columns become `Option<T>`.
 
+## Supported MySQL types
+
+| MySQL | Rust |
+|---|---|
+| `bool` / `boolean` | `bool` |
+| `tinyint` | `i8` (`u8` when `unsigned`) |
+| `smallint` | `i16` (`u16` when `unsigned`) |
+| `mediumint` / `int` / `integer` | `i32` (`u32` when `unsigned`) |
+| `bigint` | `i64` (`u64` when `unsigned`) |
+| `serial` | `u64` |
+| `year` | `u16` |
+| `float` | `f32` |
+| `double` / `real` | `f64` |
+| `decimal` / `numeric` | `bigdecimal::BigDecimal` |
+| `char` / `varchar` / `tinytext` / `text` / `mediumtext` / `longtext` | `String` |
+| `binary` / `varbinary` / `blob` family / `bit` | `Vec<u8>` |
+| `json` | `serde_json::Value` |
+| `timestamp` | `chrono::DateTime<chrono::Utc>` |
+| `datetime` | `chrono::NaiveDateTime` |
+| `date` | `chrono::NaiveDate` |
+| `time` | `chrono::NaiveTime` |
+| MySQL ENUM | generated Rust enum |
+
+Declared widths are ignored, so `varchar(255)` and `int(11) unsigned` resolve
+the same as `varchar` and `int unsigned`. MySQL spells `bool` as `tinyint(1)`,
+which is indistinguishable from a 1-byte integer in the catalog — `tinyint`
+therefore maps to `i8`, and a column that really is a boolean needs a column
+override:
+
+```yaml
+options:
+  overrides:
+    - column: "users.is_admin"
+      rs_type: "bool"
+```
+
+MySQL has no composite types, so nothing is generated for them.
+
 ## Supported query annotations
 
 | Annotation | Return type | Description |
 |---|---|---|
 | `:exec` | `Result<(), sqlx::Error>` | Execute, discard result |
 | `:execrows` | `Result<u64, sqlx::Error>` | Execute, return rows affected |
-| `:execresult` | `Result<sqlx::postgres::PgQueryResult, sqlx::Error>` | Execute, return full result |
-| `:execlastid` | `Result<T, sqlx::Error>` | Execute with RETURNING, return scalar |
+| `:execresult` | `Result<PgQueryResult, sqlx::Error>` / `Result<MySqlQueryResult, sqlx::Error>` | Execute, return the driver's full result |
+| `:execlastid` | `Result<T, sqlx::Error>` (PostgreSQL) / `Result<u64, sqlx::Error>` (MySQL) | Generated key |
 | `:one` | `Result<QueryRow, sqlx::Error>` | Fetch exactly one row |
 | `:many` | `Result<Vec<QueryRow>, sqlx::Error>` | Fetch all rows |
 | `:batchexec` | `impl Stream<Item = Result<(), sqlx::Error>>` | Lazily execute once per item |
@@ -218,13 +271,21 @@ Array types (`type[]`) become `Vec<T>`. Nullable columns become `Option<T>`.
 | `:batchmany` | `impl Stream<Item = Result<Vec<QueryRow>, sqlx::Error>>` | Lazily fetch all rows per item |
 | `:copyfrom` | `Result<u64, sqlx::Error>` | Chunked bulk insert from any `IntoIterator` |
 
-All functions are free `pub async fn` (or `pub fn` for batch streams) at module scope, taking the executor as their first argument. The bound is `E: AsExecutor`, where `AsExecutor` is the trait emitted in each generated file. Impls cover `&PgPool`, `&mut PgConnection`, `&mut Transaction<'_, Postgres>`, `&mut PoolConnection<Postgres>`, and `&mut T` of each.
+`:execlastid` differs by engine because the databases do. PostgreSQL has no
+last-insert-id, so sqlc requires a `RETURNING` clause and the value comes back
+typed as that column. MySQL reports it on the query result, so the generated
+function returns `u64` from `last_insert_id()` and the query needs no
+`RETURNING`.
+
+The batch annotations are PostgreSQL-only; sqlc does not accept them for MySQL.
+
+All functions are free `pub async fn` (or `pub fn` for batch streams) at module scope, taking the executor as their first argument. The bound is `E: AsExecutor`, where `AsExecutor` is the trait emitted in each generated file.
 
 Batch methods generate `Stream`-returning APIs and reference `futures_core` and `futures_util` directly. Consumer crates should include those dependencies alongside `sqlx`.
 
 ## sqlc extensions
 
-- **`sqlc.slice()`**: Parameters marked as slice expand to `Vec<T>` and support runtime placeholder expansion for `IN (sqlc.slice(...))`-style queries.
+- **`sqlc.slice()`**: Parameters marked as slice expand to `Vec<T>` and support runtime placeholder expansion for `IN (sqlc.slice(...))`-style queries. On PostgreSQL a query that binds the slice natively (`= ANY($1)`) skips the rewrite and passes the `Vec` straight through; every other case — and every MySQL query — expands to one placeholder per element, with an empty slice becoming `IN (NULL)`.
 - **`sqlc.embed(table)`**: Result columns from an embedded table become a nested struct with `#[sqlx(flatten)]`.
 
 ## Contributing

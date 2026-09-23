@@ -8,34 +8,88 @@ use std::{
 use serde_json::json;
 use tempfile::TempDir;
 use testcontainers_modules::{
+    mysql::Mysql,
     postgres::Postgres,
     testcontainers::{ContainerAsync, runners::AsyncRunner},
 };
+
+/// The engines an e2e case can target. Each case declares its own in the
+/// `engine:` key of its sqlc config, and the harness starts one container per
+/// engine that actually has cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Engine {
+    Postgres,
+    Mysql,
+}
+
+impl Engine {
+    pub const ALL: [Engine; 2] = [Engine::Postgres, Engine::Mysql];
+
+    fn from_name(name: &str) -> Result<Self, Box<dyn Error>> {
+        match name {
+            "postgresql" | "postgres" => Ok(Self::Postgres),
+            "mysql" => Ok(Self::Mysql),
+            other => Err(format!("e2e cases do not cover sqlc engine '{other}'").into()),
+        }
+    }
+
+    /// sqlx cargo features the generated crate needs for this engine.
+    fn sqlx_features(self) -> &'static str {
+        match self {
+            Self::Postgres => {
+                r#""postgres", "runtime-tokio", "macros", "uuid", "chrono", "ipnetwork", "mac_address", "bit-vec", "bigdecimal""#
+            }
+            Self::Mysql => r#""mysql", "runtime-tokio", "macros", "uuid", "chrono", "bigdecimal""#,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Case {
     pub name: String,
     pub dir: PathBuf,
     pub config_name: String,
+    pub engine: Engine,
     pub expect_rs: Option<String>,
     pub expected_stderr: Option<String>,
 }
 
-pub async fn start_postgres() -> Result<ContainerAsync<Postgres>, Box<dyn Error>> {
-    Ok(Postgres::default()
-        .with_db_name("sqlc_test")
-        .with_user("sqlc")
-        .with_password("sqlc")
-        .start()
-        .await?)
+/// A running database container, kept alive for the duration of a run.
+pub enum Database {
+    Postgres(ContainerAsync<Postgres>),
+    Mysql(ContainerAsync<Mysql>),
 }
 
-pub async fn database_url(postgres: &ContainerAsync<Postgres>) -> Result<String, Box<dyn Error>> {
-    Ok(format!(
-        "postgres://sqlc:sqlc@{}:{}/sqlc_test",
-        postgres.get_host().await?,
-        postgres.get_host_port_ipv4(5432).await?
-    ))
+pub async fn start_database(engine: Engine) -> Result<Database, Box<dyn Error>> {
+    Ok(match engine {
+        Engine::Postgres => Database::Postgres(
+            Postgres::default()
+                .with_db_name("sqlc_test")
+                .with_user("sqlc")
+                .with_password("sqlc")
+                .start()
+                .await?,
+        ),
+        // The module image sets no root password and creates a `test` database.
+        Engine::Mysql => Database::Mysql(Mysql::default().start().await?),
+    })
+}
+
+impl Database {
+    pub async fn url(&self) -> Result<String, Box<dyn Error>> {
+        Ok(match self {
+            Self::Postgres(c) => format!(
+                "postgres://sqlc:sqlc@{}:{}/sqlc_test",
+                c.get_host().await?,
+                c.get_host_port_ipv4(5432).await?
+            ),
+            Self::Mysql(c) => format!(
+                "mysql://root@{}:{}/test",
+                c.get_host().await?,
+                c.get_host_port_ipv4(3306).await?
+            ),
+        })
+    }
 }
 
 pub fn load_cases() -> Result<Vec<Case>, Box<dyn Error>> {
@@ -53,7 +107,7 @@ pub fn load_cases() -> Result<Vec<Case>, Box<dyn Error>> {
 
 pub fn write_generated_crate(dir: &TempDir, case: &Case) -> Result<PathBuf, Box<dyn Error>> {
     let root = dir.path().to_path_buf();
-    write_file(&root.join("Cargo.toml"), &crate_manifest(&case.name))?;
+    write_file(&root.join("Cargo.toml"), &crate_manifest(case))?;
     write_file(&root.join("src/lib.rs"), "")?;
     copy_fixture_dir(&case.dir, &root)?;
 
@@ -151,6 +205,8 @@ fn collect_cases(root: &Path, dir: &Path, cases: &mut Vec<Case>) -> Result<(), B
 }
 
 fn load_case(root: &Path, dir: &Path, config_name: &str) -> Result<Case, Box<dyn Error>> {
+    let engine = engine_from_config(&fs::read_to_string(dir.join(config_name))?)
+        .map_err(|e| format!("e2e fixture '{}': {e}", dir.display()))?;
     let expect_path = dir.join("expect.rs");
     let stderr_path = dir.join("stderr.txt");
     let expect_rs = expect_path
@@ -174,9 +230,25 @@ fn load_case(root: &Path, dir: &Path, config_name: &str) -> Result<Case, Box<dyn
         name: dir.strip_prefix(root)?.display().to_string(),
         dir: dir.to_path_buf(),
         config_name: config_name.to_string(),
+        engine,
         expect_rs,
         expected_stderr,
     })
+}
+
+/// Read the `engine:` key out of a sqlc config. The configs are small and
+/// hand-written, so a line scan avoids pulling in a YAML parser for the sake of
+/// one field — but it does mean the key must sit on its own line.
+fn engine_from_config(contents: &str) -> Result<Engine, Box<dyn Error>> {
+    for line in contents.lines() {
+        let line = line.trim().trim_start_matches("- ").trim();
+        let Some(value) = line.strip_prefix("engine:") else {
+            continue;
+        };
+        let value = value.trim().trim_matches(['"', '\'']);
+        return Engine::from_name(value);
+    }
+    Err("sqlc config has no 'engine:' key".into())
 }
 
 fn is_config_name(name: &str) -> bool {
@@ -253,9 +325,10 @@ fn cases_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/cases")
 }
 
-fn crate_manifest(case_name: &str) -> String {
+fn crate_manifest(case: &Case) -> String {
     include_str!("../fixtures/Cargo.toml.tmpl")
-        .replace("{{package_name}}", &crate_package_name(case_name))
+        .replace("{{package_name}}", &crate_package_name(&case.name))
+        .replace("{{sqlx_features}}", case.engine.sqlx_features())
 }
 
 fn crate_package_name(case_name: &str) -> String {

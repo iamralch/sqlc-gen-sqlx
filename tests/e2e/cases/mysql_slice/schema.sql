@@ -1,0 +1,5 @@
+CREATE TABLE slice_authors (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    country VARCHAR(2) NOT NULL
+);

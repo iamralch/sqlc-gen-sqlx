@@ -55,6 +55,18 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: sqlc_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -79,10 +91,15 @@ jobs:
       - name: Build WASM plugin
         run: cargo build --target wasm32-wasip1
 
-      - name: Integration tests
+      - name: Integration tests (PostgreSQL)
         run: cargo test -p basic
         env:
           DATABASE_URL: postgres://sqlc:sqlc@localhost:5432/sqlc_test
+
+      - name: Integration tests (MySQL)
+        run: cargo test -p mysql-example
+        env:
+          DATABASE_URL: mysql://root@127.0.0.1:3306/sqlc_test
 
       - name: Verify package
         run: cargo package --locked

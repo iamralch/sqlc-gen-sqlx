@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# The generated code names third-party types by crate path (`chrono::NaiveDate`,
+# `bigdecimal::BigDecimal`), so those crates are direct dependencies rather than
+# reached through sqlx's re-exports. Versions must match the ones sqlx resolves.
+bigdecimal = "0.4"
+chrono = "0.4"
 futures-core = "0.3"
 futures-util = "0.3"
 serde_json = "1"
-sqlx = { version = "0.9", features = ["postgres", "runtime-tokio", "macros", "uuid", "chrono", "ipnetwork", "mac_address", "bit-vec", "bigdecimal"] }
+sqlx = { version = "0.9", features = [{{sqlx_features}}] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

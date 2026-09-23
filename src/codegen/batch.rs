@@ -3,16 +3,14 @@ use quote::{format_ident, quote};
 use syn::parse_str;
 
 use crate::{
-    codegen::lifetimes::inject_lifetime,
-    config::Config,
+    codegen::{Ctx, lifetimes::inject_lifetime},
     error::Error,
     ident::to_snake_case,
     plugin::QueryView,
-    types::{ColumnOverride, TypeMap},
 };
 
 use super::query::{
-    Param, any_borrowed, bind_calls, dynamic_bind_statements, dynamic_sql_setup, has_dynamic_slice,
+    DynamicQuery, Param, any_borrowed, bind_calls, dynamic_query, has_dynamic_slice,
     maybe_params_struct, resolve_columns, resolve_params, row_struct, sql_const,
 };
 
@@ -86,13 +84,8 @@ fn batch_stream_method(
 }
 
 /// `:batchexec` → `fn foo(items) -> impl Stream<Item = Result<(), Error>>`
-pub fn gen_batchexec(
-    query: &QueryView<'_>,
-    type_map: &TypeMap,
-    config: &Config,
-    col_overrides: &std::collections::HashMap<String, ColumnOverride>,
-) -> Result<TokenStream, Error> {
-    let params = resolve_params(query.params.iter(), type_map, col_overrides)?;
+pub fn gen_batchexec(query: &QueryView<'_>, ctx: &Ctx<'_>) -> Result<TokenStream, Error> {
+    let params = resolve_params(query.params.iter(), ctx)?;
     if params.is_empty() {
         return Err(Error::Codegen(format!(
             ":batchexec query '{}' has no parameters; batch over empty params is not meaningful",
@@ -102,14 +95,16 @@ pub fn gen_batchexec(
 
     let fn_name = format_ident!("{}", to_snake_case(query.name));
     let (const_tokens, const_name) = sql_const(query.name, query.text);
-    let (params_struct, items_ty) = batch_items_type(query.name, &params, &config.row_derives)?;
-    let dynamic_slice = has_dynamic_slice(query.text, &params);
+    let (params_struct, items_ty) = batch_items_type(query.name, &params, ctx.row_derives())?;
+    let dynamic_slice = has_dynamic_slice(ctx, query.text, &params);
 
     let next_body = if dynamic_slice {
         let item_arg = (params.len() >= 2).then(|| format_ident!("item"));
         let item_alias = single_item_alias(&params);
-        let sql_setup = dynamic_sql_setup(&const_name, &params, item_arg.as_ref());
-        let bind_setup = dynamic_bind_statements(&params, item_arg.as_ref());
+        let DynamicQuery {
+            setup: sql_setup,
+            binds: bind_setup,
+        } = dynamic_query(ctx, query.text, &const_name, &params, item_arg.as_ref())?;
         quote! {
             #item_alias
             #sql_setup
@@ -143,13 +138,8 @@ pub fn gen_batchexec(
 }
 
 /// `:batchone` → `fn foo(items) -> impl Stream<Item = Result<Row, Error>>`
-pub fn gen_batchone(
-    query: &QueryView<'_>,
-    type_map: &TypeMap,
-    config: &Config,
-    col_overrides: &std::collections::HashMap<String, ColumnOverride>,
-) -> Result<TokenStream, Error> {
-    let params = resolve_params(query.params.iter(), type_map, col_overrides)?;
+pub fn gen_batchone(query: &QueryView<'_>, ctx: &Ctx<'_>) -> Result<TokenStream, Error> {
+    let params = resolve_params(query.params.iter(), ctx)?;
     if params.is_empty() {
         return Err(Error::Codegen(format!(
             ":batchone query '{}' has no parameters",
@@ -157,19 +147,21 @@ pub fn gen_batchone(
         )));
     }
 
-    let columns = resolve_columns(query.columns.iter(), type_map, col_overrides)?;
+    let columns = resolve_columns(query.columns.iter(), ctx)?;
     let fn_name = format_ident!("{}", to_snake_case(query.name));
     let row_name = crate::ident::type_ident(&crate::ident::query_row_name(query.name));
     let (const_tokens, const_name) = sql_const(query.name, query.text);
-    let row_tokens = row_struct(query.name, &columns, &config.row_derives)?;
-    let (params_struct, items_ty) = batch_items_type(query.name, &params, &config.row_derives)?;
-    let dynamic_slice = has_dynamic_slice(query.text, &params);
+    let row_tokens = row_struct(query.name, &columns, ctx.row_derives())?;
+    let (params_struct, items_ty) = batch_items_type(query.name, &params, ctx.row_derives())?;
+    let dynamic_slice = has_dynamic_slice(ctx, query.text, &params);
 
     let next_body = if dynamic_slice {
         let item_arg = (params.len() >= 2).then(|| format_ident!("item"));
         let item_alias = single_item_alias(&params);
-        let sql_setup = dynamic_sql_setup(&const_name, &params, item_arg.as_ref());
-        let bind_setup = dynamic_bind_statements(&params, item_arg.as_ref());
+        let DynamicQuery {
+            setup: sql_setup,
+            binds: bind_setup,
+        } = dynamic_query(ctx, query.text, &const_name, &params, item_arg.as_ref())?;
         quote! {
             #item_alias
             #sql_setup
@@ -203,13 +195,8 @@ pub fn gen_batchone(
 }
 
 /// `:batchmany` → `fn foo(items) -> impl Stream<Item = Result<Vec<Row>, Error>>`
-pub fn gen_batchmany(
-    query: &QueryView<'_>,
-    type_map: &TypeMap,
-    config: &Config,
-    col_overrides: &std::collections::HashMap<String, ColumnOverride>,
-) -> Result<TokenStream, Error> {
-    let params = resolve_params(query.params.iter(), type_map, col_overrides)?;
+pub fn gen_batchmany(query: &QueryView<'_>, ctx: &Ctx<'_>) -> Result<TokenStream, Error> {
+    let params = resolve_params(query.params.iter(), ctx)?;
     if params.is_empty() {
         return Err(Error::Codegen(format!(
             ":batchmany query '{}' has no parameters",
@@ -217,19 +204,21 @@ pub fn gen_batchmany(
         )));
     }
 
-    let columns = resolve_columns(query.columns.iter(), type_map, col_overrides)?;
+    let columns = resolve_columns(query.columns.iter(), ctx)?;
     let fn_name = format_ident!("{}", to_snake_case(query.name));
     let row_name = crate::ident::type_ident(&crate::ident::query_row_name(query.name));
     let (const_tokens, const_name) = sql_const(query.name, query.text);
-    let row_tokens = row_struct(query.name, &columns, &config.row_derives)?;
-    let (params_struct, items_ty) = batch_items_type(query.name, &params, &config.row_derives)?;
-    let dynamic_slice = has_dynamic_slice(query.text, &params);
+    let row_tokens = row_struct(query.name, &columns, ctx.row_derives())?;
+    let (params_struct, items_ty) = batch_items_type(query.name, &params, ctx.row_derives())?;
+    let dynamic_slice = has_dynamic_slice(ctx, query.text, &params);
 
     let next_body = if dynamic_slice {
         let item_arg = (params.len() >= 2).then(|| format_ident!("item"));
         let item_alias = single_item_alias(&params);
-        let sql_setup = dynamic_sql_setup(&const_name, &params, item_arg.as_ref());
-        let bind_setup = dynamic_bind_statements(&params, item_arg.as_ref());
+        let DynamicQuery {
+            setup: sql_setup,
+            binds: bind_setup,
+        } = dynamic_query(ctx, query.text, &const_name, &params, item_arg.as_ref())?;
         quote! {
             #item_alias
             #sql_setup

@@ -3,23 +3,16 @@ use quote::{format_ident, quote};
 use syn::parse_str;
 
 use crate::{
-    codegen::lifetimes::inject_lifetime,
-    config::Config,
+    codegen::{Ctx, lifetimes::inject_lifetime},
     error::Error,
     ident::to_snake_case,
     plugin::QueryView,
-    types::{ColumnOverride, TypeMap},
 };
 
 use super::query::{Param, any_borrowed, maybe_params_struct, resolve_params, sql_const};
 
-pub fn gen_copyfrom(
-    query: &QueryView<'_>,
-    type_map: &TypeMap,
-    config: &Config,
-    col_overrides: &std::collections::HashMap<String, ColumnOverride>,
-) -> Result<TokenStream, Error> {
-    let params = resolve_params(query.params.iter(), type_map, col_overrides)?;
+pub fn gen_copyfrom(query: &QueryView<'_>, ctx: &Ctx<'_>) -> Result<TokenStream, Error> {
+    let params = resolve_params(query.params.iter(), ctx)?;
     if params.is_empty() {
         return Err(Error::Codegen(format!(
             ":copyfrom query '{}' has no parameters",
@@ -31,12 +24,12 @@ pub fn gen_copyfrom(
     let batch_size_name = format_ident!("{}_BATCH_SIZE", to_snake_case(query.name).to_uppercase());
     let insert_prefix = insert_prefix(query.text)?;
     let (const_tokens, const_name) = sql_const(query.name, &insert_prefix);
-    let batch_size = std::cmp::max(1usize, 65_535usize / params.len());
+    let batch_size = std::cmp::max(1usize, ctx.engine.max_bind_params() / params.len());
     let has_borrowed = any_borrowed(&params);
 
     let (params_struct, items_ty, builder_binds) = if params.len() >= 2 {
         let (struct_tokens, struct_ident) =
-            maybe_params_struct(query.name, &params, &config.row_derives)?
+            maybe_params_struct(query.name, &params, ctx.row_derives())?
                 .expect("guarded by params.len() >= 2");
         let item_ty = if has_borrowed {
             quote! { #struct_ident<'a> }
@@ -68,6 +61,7 @@ pub fn gen_copyfrom(
         quote! { <E: AsExecutor, I> }
     };
 
+    let db = ctx.engine.database_type();
     let fn_tokens = quote! {
         pub async fn #fn_name #generics (mut db: E, items: I) -> Result<u64, sqlx::Error>
         where
@@ -82,7 +76,7 @@ pub fn gen_copyfrom(
                     break;
                 }
 
-                let mut query_builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(#const_name);
+                let mut query_builder = sqlx::QueryBuilder::<#db>::new(#const_name);
                 query_builder.push_values(chunk, |mut b, item| {
                     #builder_binds
                 });
