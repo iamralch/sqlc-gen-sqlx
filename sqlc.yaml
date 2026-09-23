@@ -53,3 +53,12 @@ sql:
           overrides:
             - db_type: "text"
               borrowed_rs_type: "&str"
+
+  - schema: examples/mysql/schema.sql
+    queries: examples/mysql/queries.sql
+    engine: mysql
+    codegen:
+      - plugin: sqlc-gen-sqlx
+        out: examples/mysql/src
+        options:
+          output: queries.rs

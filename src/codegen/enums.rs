@@ -5,24 +5,39 @@ use syn::parse_str;
 
 use crate::{
     catalog::EnumInfo,
+    engine::Engine,
     error::Error,
     ident::{type_ident, variant_ident},
 };
 
-/// Emit a Rust enum from a PG ENUM type.
+/// Emit a Rust enum from a database ENUM type.
 ///
-/// Generated output example:
+/// PostgreSQL output:
 /// ```text
 /// #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type)]
 /// #[sqlx(type_name = "status")]
 /// pub enum Status {
 ///     #[sqlx(rename = "active")]
 ///     Active,
-///     #[sqlx(rename = "inactive")]
-///     Inactive,
 /// }
 /// ```
-pub fn gen_enum(info: &EnumInfo, extra_derives: &[String]) -> Result<TokenStream, Error> {
+///
+/// MySQL output differs in two ways, both forced by sqlx:
+///
+/// - There is no `type_name`. PostgreSQL enums are catalog types the wire
+///   protocol resolves by name; MySQL sends `ENUM` columns as strings and has
+///   no type to look up.
+/// - `sqlx::Type` is not derived. Its MySQL impl reports
+///   `MySqlTypeInfo::__enum()`, which the driver's compatibility check does not
+///   accept for a real `ENUM` column — decoding one fails at runtime with
+///   "mismatched types". Only `Encode`/`Decode` are derived, and the `Type`
+///   impl below defers to `str`, which accepts `ENUM`, `CHAR`, `VARCHAR` and
+///   the `TEXT` family.
+pub fn gen_enum(
+    info: &EnumInfo,
+    engine: Engine,
+    extra_derives: &[String],
+) -> Result<TokenStream, Error> {
     let rust_name = type_ident(&info.rust_name);
     let type_name = &info.type_name;
 
@@ -43,12 +58,33 @@ pub fn gen_enum(info: &EnumInfo, extra_derives: &[String]) -> Result<TokenStream
         derive_paths.push(quote! { #path });
     }
 
-    Ok(quote! {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type, #(#derive_paths),*)]
-        #[sqlx(type_name = #type_name)]
-        pub enum #rust_name {
-            #(#variant_tokens)*
-        }
+    Ok(match engine {
+        Engine::Postgresql => quote! {
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type, #(#derive_paths),*)]
+            #[sqlx(type_name = #type_name)]
+            pub enum #rust_name {
+                #(#variant_tokens)*
+            }
+        },
+        Engine::Mysql => quote! {
+            #[derive(
+                Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Encode, sqlx::Decode,
+                #(#derive_paths),*
+            )]
+            pub enum #rust_name {
+                #(#variant_tokens)*
+            }
+
+            impl sqlx::Type<sqlx::MySql> for #rust_name {
+                fn type_info() -> sqlx::mysql::MySqlTypeInfo {
+                    <str as sqlx::Type<sqlx::MySql>>::type_info()
+                }
+
+                fn compatible(ty: &sqlx::mysql::MySqlTypeInfo) -> bool {
+                    <str as sqlx::Type<sqlx::MySql>>::compatible(ty)
+                }
+            }
+        },
     })
 }
 
@@ -60,7 +96,7 @@ mod tests {
     fn status_enum() -> EnumInfo {
         EnumInfo {
             schema: "public".to_string(),
-            pg_name: "status".to_string(),
+            db_name: "status".to_string(),
             rust_name: "Status".to_string(),
             type_name: "status".to_string(),
             vals: vec![
@@ -73,7 +109,7 @@ mod tests {
 
     #[test]
     fn generates_enum_with_variants() {
-        let tokens = gen_enum(&status_enum(), &[]).unwrap();
+        let tokens = gen_enum(&status_enum(), Engine::Postgresql, &[]).unwrap();
         let code = tokens.to_string();
         assert!(code.contains("Status"), "expected 'Status' in:\n{code}");
         assert!(code.contains("Active"), "expected 'Active' in:\n{code}");
@@ -83,7 +119,7 @@ mod tests {
 
     #[test]
     fn generates_sqlx_rename_attrs() {
-        let tokens = gen_enum(&status_enum(), &[]).unwrap();
+        let tokens = gen_enum(&status_enum(), Engine::Postgresql, &[]).unwrap();
         let code = tokens.to_string();
         assert!(
             code.contains(r#""active""#),
@@ -97,7 +133,7 @@ mod tests {
 
     #[test]
     fn generates_sqlx_type_name_attr() {
-        let tokens = gen_enum(&status_enum(), &[]).unwrap();
+        let tokens = gen_enum(&status_enum(), Engine::Postgresql, &[]).unwrap();
         let code = tokens.to_string();
         assert!(
             code.contains(r#""status""#),
@@ -107,7 +143,12 @@ mod tests {
 
     #[test]
     fn appends_extra_derives() {
-        let tokens = gen_enum(&status_enum(), &["serde::Serialize".to_string()]).unwrap();
+        let tokens = gen_enum(
+            &status_enum(),
+            Engine::Postgresql,
+            &["serde::Serialize".to_string()],
+        )
+        .unwrap();
         let code = tokens.to_string();
         // quote serializes :: as " :: " with spaces
         assert!(
@@ -117,8 +158,41 @@ mod tests {
     }
 
     #[test]
+    fn mysql_enum_defers_compatibility_to_str() {
+        let code = gen_enum(&status_enum(), Engine::Mysql, &[])
+            .unwrap()
+            .to_string();
+        assert!(
+            !code.contains("type_name"),
+            "MySQL enums must not carry #[sqlx(type_name)] in:\n{code}"
+        );
+        assert!(
+            !code.contains("sqlx :: Type ,") && !code.contains("sqlx :: Type,"),
+            "MySQL enums must not derive sqlx::Type in:\n{code}"
+        );
+        for expected in ["sqlx :: Encode", "sqlx :: Decode", "fn compatible"] {
+            assert!(code.contains(expected), "expected {expected} in:\n{code}");
+        }
+    }
+
+    #[test]
+    fn mysql_enum_keeps_variant_renames() {
+        let code = gen_enum(&status_enum(), Engine::Mysql, &[])
+            .unwrap()
+            .to_string();
+        assert!(
+            code.contains(r#""active""#),
+            "expected rename = \"active\" in:\n{code}"
+        );
+    }
+
+    #[test]
     fn invalid_extra_derive_returns_error() {
-        let result = gen_enum(&status_enum(), &["not a path !!!".to_string()]);
+        let result = gen_enum(
+            &status_enum(),
+            Engine::Postgresql,
+            &["not a path !!!".to_string()],
+        );
         assert!(result.is_err(), "expected error for invalid derive path");
     }
 }

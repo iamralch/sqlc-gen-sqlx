@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod codegen;
 pub mod config;
 pub mod emit;
+pub mod engine;
 pub mod error;
 pub mod ident;
 pub mod types;

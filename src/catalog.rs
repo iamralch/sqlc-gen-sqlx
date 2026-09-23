@@ -1,5 +1,6 @@
 // src/catalog.rs
 use crate::{
+    engine::Engine,
     error::Error,
     ident::{field_ident, to_pascal_case},
     plugin::GenerateRequestView,
@@ -8,7 +9,7 @@ use crate::{
 
 pub struct EnumInfo {
     pub schema: String,
-    pub pg_name: String,
+    pub db_name: String,
     pub rust_name: String,
     /// Used for `#[sqlx(type_name = "...")]`: "status" in public schema,
     /// "myschema.status" in non-default schemas.
@@ -18,7 +19,7 @@ pub struct EnumInfo {
 }
 
 pub struct CompositeField {
-    pub pg_name: String,
+    pub db_name: String,
     pub rust_ident: proc_macro2::Ident,
     /// Always `Option<T>` — composite fields are always nullable on the wire.
     pub rust_type: String,
@@ -26,7 +27,7 @@ pub struct CompositeField {
 
 pub struct CompositeInfo {
     pub schema: String,
-    pub pg_name: String,
+    pub db_name: String,
     pub rust_name: String,
     pub type_name: String,
     pub fields: Vec<CompositeField>,
@@ -40,6 +41,7 @@ pub struct CatalogInfo {
 /// Walk the catalog, register discovered custom types into `type_map`, return info for codegen.
 pub fn walk(
     request: &GenerateRequestView<'_>,
+    engine: Engine,
     type_map: &mut TypeMap,
 ) -> Result<CatalogInfo, Error> {
     let mut enums = Vec::new();
@@ -59,15 +61,15 @@ pub fn walk(
             let type_name = sqlx_type_name(schema.name, e.name, default_schema);
             // EnumView.vals is RepeatedView<'a, &'a str> — each item is &str.
             let vals: Vec<String> = e.vals.iter().map(|v| v.to_string()).collect();
-            let pg_key = if schema.name == default_schema || schema.name.is_empty() {
+            let db_key = if schema.name == default_schema || schema.name.is_empty() {
                 e.name.to_string()
             } else {
                 format!("{}.{}", schema.name, e.name)
             };
-            type_map.register(&pg_key, &rust_name, false);
+            type_map.register(&db_key, &rust_name, false);
             enums.push(EnumInfo {
                 schema: schema.name.to_string(),
-                pg_name: e.name.to_string(),
+                db_name: e.name.to_string(),
                 rust_name,
                 type_name,
                 vals,
@@ -76,6 +78,13 @@ pub fn walk(
     }
 
     // Phase 2: composites — uses type_map which now includes enum types.
+    // Only PostgreSQL has user-defined composite types; other engines never
+    // populate `composite_types`, so skipping the walk avoids misreading a
+    // same-named table as a composite.
+    if !engine.supports_composite_types() {
+        return Ok(CatalogInfo { enums, composites });
+    }
+
     // ASSUMPTION: composite fields are exposed via schema.tables, where
     // table.rel.name == composite_type.name. If sqlc does not populate tables
     // for composite types, Task 7 will catch this and the walk logic must be
@@ -101,7 +110,7 @@ pub fn walk(
 
             let mut fields = Vec::new();
             for col in table.columns.iter() {
-                let pg_type = col.r#type.as_option().map(|t| t.name).unwrap_or("");
+                let db_type = col.r#type.as_option().map(|t| t.name).unwrap_or("");
                 let array_dims = if col.array_dims > 0 {
                     col.array_dims as usize
                 } else {
@@ -110,29 +119,29 @@ pub fn walk(
                 // Intentionally force nullable=true: sqlx deserializes composite
                 // type fields as Option<T> regardless of the NOT NULL constraint.
                 let rust_type = type_map
-                    .resolve_pg_type_dims(pg_type, true, array_dims)
+                    .resolve_db_type_dims(db_type, true, array_dims)
                     .ok_or_else(|| {
                         Error::Codegen(format!(
-                            "composite '{}.{}' field '{}' has unknown type '{pg_type}'",
+                            "composite '{}.{}' field '{}' has unknown type '{db_type}'",
                             schema.name, rel.name, col.name
                         ))
                     })?;
                 fields.push(CompositeField {
-                    pg_name: col.name.to_string(),
+                    db_name: col.name.to_string(),
                     rust_ident: field_ident(col.name),
                     rust_type: rust_type.rust_type,
                 });
             }
 
-            let pg_key = if schema.name == default_schema || schema.name.is_empty() {
+            let db_key = if schema.name == default_schema || schema.name.is_empty() {
                 rel.name.to_string()
             } else {
                 format!("{}.{}", schema.name, rel.name)
             };
-            type_map.register(&pg_key, &rust_name, false);
+            type_map.register(&db_key, &rust_name, false);
             composites.push(CompositeInfo {
                 schema: schema.name.to_string(),
-                pg_name: rel.name.to_string(),
+                db_name: rel.name.to_string(),
                 rust_name,
                 type_name,
                 fields,

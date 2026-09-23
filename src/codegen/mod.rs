@@ -1,67 +1,61 @@
+use std::collections::HashMap;
+
 use crate::{
-    catalog, config::Config, emit::FileEmitter, error::Error, plugin::GenerateRequestView,
-    types::TypeMap,
+    catalog,
+    config::Config,
+    emit::FileEmitter,
+    engine::Engine,
+    error::Error,
+    plugin::GenerateRequestView,
+    types::{ColumnOverride, TypeMap},
 };
 
 mod batch;
 mod composites;
 mod copyfrom;
 mod enums;
+mod executor;
 pub(crate) mod lifetimes;
 mod query;
 
+/// Everything the per-command generators need that is not the query itself.
+pub(crate) struct Ctx<'a> {
+    pub(crate) engine: Engine,
+    pub(crate) config: &'a Config,
+    pub(crate) type_map: &'a TypeMap,
+    pub(crate) col_overrides: &'a HashMap<String, ColumnOverride>,
+}
+
+impl Ctx<'_> {
+    /// Extra derives applied to row and params structs.
+    pub(crate) fn row_derives(&self) -> &[String] {
+        &self.config.row_derives
+    }
+}
+
 pub fn generate(request: &GenerateRequestView<'_>, config: &Config) -> Result<String, Error> {
-    let mut type_map = TypeMap::new(&config.overrides, &config.copy_cheap_types);
-    let catalog_info = catalog::walk(request, &mut type_map)?;
+    let engine = match request.settings.as_option() {
+        Some(settings) => Engine::from_name(settings.engine)?,
+        None => Engine::default(),
+    };
+
+    let mut type_map = TypeMap::new(engine, &config.overrides, &config.copy_cheap_types);
+    let catalog_info = catalog::walk(request, engine, &mut type_map)?;
     let col_overrides = crate::types::build_column_overrides(&config.overrides);
+    let ctx = Ctx {
+        engine,
+        config,
+        type_map: &type_map,
+        col_overrides: &col_overrides,
+    };
     let mut emitter = FileEmitter::new(request.sqlc_version, env!("CARGO_PKG_VERSION"));
 
     // Emit the AsExecutor trait + impls up front so query functions can reference it.
-    emitter.push(quote::quote! {
-        pub trait AsExecutor {
-            fn as_executor(&mut self) -> impl sqlx::Executor<'_, Database = sqlx::Postgres>;
-        }
-
-        impl AsExecutor for sqlx::PgPool {
-            fn as_executor(&mut self) -> impl sqlx::Executor<'_, Database = sqlx::Postgres> {
-                &*self
-            }
-        }
-
-        impl AsExecutor for &sqlx::PgPool {
-            fn as_executor(&mut self) -> impl sqlx::Executor<'_, Database = sqlx::Postgres> {
-                *self
-            }
-        }
-
-        impl AsExecutor for sqlx::PgConnection {
-            fn as_executor(&mut self) -> impl sqlx::Executor<'_, Database = sqlx::Postgres> {
-                &mut *self
-            }
-        }
-
-        impl AsExecutor for sqlx::Transaction<'_, sqlx::Postgres> {
-            fn as_executor(&mut self) -> impl sqlx::Executor<'_, Database = sqlx::Postgres> {
-                &mut **self
-            }
-        }
-
-        impl AsExecutor for sqlx::pool::PoolConnection<sqlx::Postgres> {
-            fn as_executor(&mut self) -> impl sqlx::Executor<'_, Database = sqlx::Postgres> {
-                &mut **self
-            }
-        }
-
-        impl<T: AsExecutor + ?Sized> AsExecutor for &mut T {
-            fn as_executor(&mut self) -> impl sqlx::Executor<'_, Database = sqlx::Postgres> {
-                (**self).as_executor()
-            }
-        }
-    });
+    emitter.push(executor::gen_as_executor(engine));
 
     // Emit type definitions before query code.
     for info in &catalog_info.enums {
-        emitter.push(enums::gen_enum(info, &config.enum_derives)?);
+        emitter.push(enums::gen_enum(info, engine, &config.enum_derives)?);
     }
     for info in &catalog_info.composites {
         emitter.push(composites::gen_composite(info, &config.composite_derives)?);
@@ -69,16 +63,16 @@ pub fn generate(request: &GenerateRequestView<'_>, config: &Config) -> Result<St
 
     for q in request.queries.iter() {
         let tokens = match q.cmd {
-            ":exec" => query::gen_exec(q, &type_map, config, &col_overrides)?,
-            ":execrows" => query::gen_execrows(q, &type_map, config, &col_overrides)?,
-            ":execresult" => query::gen_execresult(q, &type_map, config, &col_overrides)?,
-            ":execlastid" => query::gen_execlastid(q, &type_map, config, &col_overrides)?,
-            ":batchexec" => batch::gen_batchexec(q, &type_map, config, &col_overrides)?,
-            ":batchone" => batch::gen_batchone(q, &type_map, config, &col_overrides)?,
-            ":batchmany" => batch::gen_batchmany(q, &type_map, config, &col_overrides)?,
-            ":copyfrom" => copyfrom::gen_copyfrom(q, &type_map, config, &col_overrides)?,
-            ":one" => query::gen_one(q, &type_map, config, &col_overrides)?,
-            ":many" => query::gen_many(q, &type_map, config, &col_overrides)?,
+            ":exec" => query::gen_exec(q, &ctx)?,
+            ":execrows" => query::gen_execrows(q, &ctx)?,
+            ":execresult" => query::gen_execresult(q, &ctx)?,
+            ":execlastid" => query::gen_execlastid(q, &ctx)?,
+            ":batchexec" => batch::gen_batchexec(q, &ctx)?,
+            ":batchone" => batch::gen_batchone(q, &ctx)?,
+            ":batchmany" => batch::gen_batchmany(q, &ctx)?,
+            ":copyfrom" => copyfrom::gen_copyfrom(q, &ctx)?,
+            ":one" => query::gen_one(q, &ctx)?,
+            ":many" => query::gen_many(q, &ctx)?,
             cmd => {
                 eprintln!("sqlc-gen-sqlx: skipping unsupported annotation {cmd}");
                 continue;
